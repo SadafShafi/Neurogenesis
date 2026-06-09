@@ -1,0 +1,2 @@
+Fix Starvation: You need to ensure new adapters are guaranteed some gradients early on. You could either force-route a portion of the top-k slots to the newest adapter, or compute the Top-K normalized scores per task rather than globally.
+Fix Senescence Masking: Iterate over self._senescent_mask for all tasks to ap
