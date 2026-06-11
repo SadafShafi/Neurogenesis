@@ -490,26 +490,34 @@ class EvoMoRAMLinear(nn.Module):
 
         total_r = A_cat.shape[0]
 
-        # 1. Raw activations
-        raw_act = F.linear(x, A_cat)  # [batch, total_r]
+        # 1. Cosine Similarity Routing
+        # L2-normalize experts to remove magnitude bias (prevents gradient starvation)
+        A_cat_norm = A_cat / (torch.norm(A_cat, p=2, dim=1, keepdim=True) + 1e-8)
+        route_act = F.linear(x, A_cat_norm)  # [batch, total_r]
+        
+        # Original raw activations for value retrieval
+        raw_act = F.linear(x, A_cat)
 
-        # 2. Relevance Scoring (L2 Normalization)
-        norm_act = raw_act / (torch.norm(raw_act, p=2, dim=-1, keepdim=True) + 1e-8)
+        # 2. Relevance Scoring
+        # We still normalize the routing scores across experts to keep softmax stable
+        norm_act = route_act / (torch.norm(route_act, p=2, dim=-1, keepdim=True) + 1e-8)
 
         # 3. Sparsity (Top-k masking)
         current_k = min(self.k, total_r)
 
         # --- Apply Senescence Mask ---
         if hasattr(self, '_senescent_mask') and len(active_A_list) > 0:
-            task_idx = len(active_A_list) - 1
-            if task_idx in self._senescent_mask:
-                s_mask = self._senescent_mask[task_idx]
-                if s_mask.any():
-                    offset = sum(A.shape[0] for A in active_A_list[:-1])
-                    full_s_mask = torch.zeros(total_r, dtype=torch.bool, device=norm_act.device)
+            full_s_mask = torch.zeros(total_r, dtype=torch.bool, device=norm_act.device)
+            offset = 0
+            for t_idx, A in enumerate(active_A_list):
+                if t_idx in self._senescent_mask:
+                    s_mask = self._senescent_mask[t_idx]
                     full_s_mask[offset:offset+len(s_mask)] = s_mask
-                    # Mask senescent experts with -inf before top-k selection
-                    norm_act = norm_act.masked_fill(full_s_mask.unsqueeze(0), float('-inf'))
+                offset += A.shape[0]
+                
+            if full_s_mask.any():
+                # Mask senescent experts with -inf before top-k selection
+                norm_act = norm_act.masked_fill(full_s_mask.unsqueeze(0), float('-inf'))
 
         topk_vals, topk_indices = torch.topk(norm_act, current_k, dim=-1)
         mask = torch.full_like(norm_act, float('-inf'))
@@ -553,12 +561,12 @@ class ActorCritic(nn.Module):
         # # ACTOR NETWORK — Using EvoMoRAM Layers
         # self.actor_fc1 = EvoMoRAMLinear(obs_dim, 128, r_probe=2, r_full=16, k=4)
         # self.actor_fc2 = EvoMoRAMLinear(128, 64, r_probe=2, r_full=16, k=4)
-        # self.actor_out = EvoMoRAMLinear(64, action_dim, r_probe=2, r_full=16, k=4)
+        # self.actor_out = nn.Linear(64, action_dim)
         
         # # CRITIC NETWORK — Using EvoMoRAM Layers
         # self.critic_fc1 = EvoMoRAMLinear(obs_dim, 128, r_probe=2, r_full=16, k=4)
         # self.critic_fc2 = EvoMoRAMLinear(128, 64, r_probe=2, r_full=16, k=4)
-        # self.critic_out = EvoMoRAMLinear(64, 1, r_probe=2, r_full=16, k=4)
+        # self.critic_out = nn.Linear(64, 1)
         
         # self.activation = nn.Tanh()
 
@@ -566,12 +574,12 @@ class ActorCritic(nn.Module):
         # ACTOR NETWORK — Using EvoMoRAM Layers
         self.actor_fc1 = EvoMoRAMLinear(obs_dim, 64, r_probe=2, r_full=16, k=4)
         self.actor_fc2 = EvoMoRAMLinear(64, 32, r_probe=2, r_full=16, k=4)
-        self.actor_out = EvoMoRAMLinear(32, action_dim, r_probe=2, r_full=16, k=4)
+        self.actor_out = nn.Linear(32, action_dim)
         
         # CRITIC NETWORK — Using EvoMoRAM Layers
         self.critic_fc1 = EvoMoRAMLinear(obs_dim, 64, r_probe=2, r_full=16, k=4)
         self.critic_fc2 = EvoMoRAMLinear(64, 32, r_probe=2, r_full=16, k=4)
-        self.critic_out = EvoMoRAMLinear(32, 1, r_probe=2, r_full=16, k=4)
+        self.critic_out = nn.Linear(32, 1)
         
         self.activation = nn.Tanh()
 
