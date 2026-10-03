@@ -308,7 +308,7 @@ class EvoMoRAMLinear(nn.Module):
             torch.randn(self.r_probe, self.in_features, device=device) / np.sqrt(self.in_features)
         )
         new_B = nn.Parameter(
-            torch.zeros(self.out_features, self.r_probe, device=device)
+            torch.randn(self.out_features, self.r_probe, device=device) * 0.01
         )
         
         self.A_list.append(new_A)
@@ -336,7 +336,7 @@ class EvoMoRAMLinear(nn.Module):
         
         # New capacity to add
         expand_A = torch.randn(r_expand, self.in_features, device=device) / np.sqrt(self.in_features)
-        expand_B = torch.zeros(self.out_features, r_expand, device=device)
+        expand_B = torch.randn(self.out_features, r_expand, device=device) * 0.01
         
         # Concatenate: preserve probe + add new capacity
         new_A = nn.Parameter(torch.cat([old_A.data, expand_A], dim=0))  # [r_full, in_features]
@@ -475,7 +475,7 @@ class EvoMoRAMLinear(nn.Module):
         self.B_list.append(new_B)
         self.adapter_states.append('full')
 
-    def forward(self, x):
+    def forward(self, x, task_id=None):
         base_out = self.base_layer(x)
         
         active_A_list = list(self.A_list)
@@ -499,8 +499,23 @@ class EvoMoRAMLinear(nn.Module):
         raw_act = F.linear(x, A_cat)
 
         # 2. Relevance Scoring
-        # We still normalize the routing scores across experts to keep softmax stable
-        norm_act = route_act / (torch.norm(route_act, p=2, dim=-1, keepdim=True) + 1e-8)
+        # Remove the normalization across experts to prevent shrinking scores as total_r grows
+        norm_act = route_act 
+        
+        if self.training:
+            # Add noise to routing to encourage exploration of new experts and prevent collapse
+            noisy_norm_act = norm_act + torch.randn_like(norm_act) * 0.1
+        else:
+            noisy_norm_act = norm_act
+
+        # --- Apply Task Isolation Mask ---
+        if task_id is not None and task_id < len(active_A_list) - 1:
+            # Mask out experts from tasks > task_id
+            allowed_r = sum(A.shape[0] for A in active_A_list[:task_id + 1])
+            if allowed_r < total_r:
+                future_mask = torch.ones(total_r, dtype=torch.bool, device=norm_act.device)
+                future_mask[:allowed_r] = False
+                noisy_norm_act = noisy_norm_act.masked_fill(future_mask.unsqueeze(0), float('-inf'))
 
         # 3. Sparsity (Top-k masking)
         current_k = min(self.k, total_r)
@@ -517,11 +532,14 @@ class EvoMoRAMLinear(nn.Module):
                 
             if full_s_mask.any():
                 # Mask senescent experts with -inf before top-k selection
-                norm_act = norm_act.masked_fill(full_s_mask.unsqueeze(0), float('-inf'))
+                noisy_norm_act = noisy_norm_act.masked_fill(full_s_mask.unsqueeze(0), float('-inf'))
 
-        topk_vals, topk_indices = torch.topk(norm_act, current_k, dim=-1)
+        topk_vals, topk_indices = torch.topk(noisy_norm_act, current_k, dim=-1)
+        
+        # We still want the ACTUAL `norm_act` values in the mask for the softmax, not the noisy ones!
         mask = torch.full_like(norm_act, float('-inf'))
-        mask.scatter_(-1, topk_indices, topk_vals)
+        selected_true_vals = torch.gather(norm_act, -1, topk_indices)
+        mask.scatter_(-1, topk_indices, selected_true_vals)
 
         # --- Activation tracking for apoptosis ---
         if self._tracking_activations and self.training and self._activation_counts is not None:
@@ -574,44 +592,64 @@ class ActorCritic(nn.Module):
         # ACTOR NETWORK — Using EvoMoRAM Layers
         self.actor_fc1 = EvoMoRAMLinear(obs_dim, 64, r_probe=2, r_full=16, k=4)
         self.actor_fc2 = EvoMoRAMLinear(64, 32, r_probe=2, r_full=16, k=4)
-        self.actor_out = nn.Linear(32, action_dim)
+        self.actor_out = nn.ModuleList([nn.Linear(32, action_dim)])
         
         # CRITIC NETWORK — Using EvoMoRAM Layers
         self.critic_fc1 = EvoMoRAMLinear(obs_dim, 64, r_probe=2, r_full=16, k=4)
         self.critic_fc2 = EvoMoRAMLinear(64, 32, r_probe=2, r_full=16, k=4)
-        self.critic_out = nn.Linear(32, 1)
+        self.critic_out = nn.ModuleList([nn.Linear(32, 1)])
         
         self.activation = nn.Tanh()
+
+    def add_task_head(self):
+        # Freeze existing heads
+        for head in self.actor_out:
+            for param in head.parameters():
+                param.requires_grad = False
+        for head in self.critic_out:
+            for param in head.parameters():
+                param.requires_grad = False
+                
+        # Add new heads
+        device = next(self.parameters()).device
+        new_actor_head = nn.Linear(32, self.actor_out[0].out_features).to(device)
+        new_critic_head = nn.Linear(32, 1).to(device)
+        self.actor_out.append(new_actor_head)
+        self.critic_out.append(new_critic_head)
 
     def forward(self):
         raise NotImplementedError
     
-    def act(self, state):
+    def act(self, state, task_id=None):
         # Actor
-        x_a = self.activation(self.actor_fc1(state))
-        x_a = self.activation(self.actor_fc2(x_a))
-        action_logits = self.actor_out(x_a)
+        x_a = self.activation(self.actor_fc1(state, task_id))
+        x_a = self.activation(self.actor_fc2(x_a, task_id))
+        
+        head_idx = task_id if task_id is not None else len(self.actor_out) - 1
+        action_logits = self.actor_out[head_idx](x_a)
         action_probs = Categorical(logits=action_logits)
         action = action_probs.sample()
         
         # Critic
-        x_c = self.activation(self.critic_fc1(state))
-        x_c = self.activation(self.critic_fc2(x_c))
-        state_value = self.critic_out(x_c)
+        x_c = self.activation(self.critic_fc1(state, task_id))
+        x_c = self.activation(self.critic_fc2(x_c, task_id))
+        state_value = self.critic_out[head_idx](x_c)
         
         return action, action_probs.log_prob(action), state_value.squeeze(-1)
 
-    def evaluate(self, state, action):
+    def evaluate(self, state, action, task_id=None):
         # Actor
-        x_a = self.activation(self.actor_fc1(state))
-        x_a = self.activation(self.actor_fc2(x_a))
-        action_logits = self.actor_out(x_a)
+        x_a = self.activation(self.actor_fc1(state, task_id))
+        x_a = self.activation(self.actor_fc2(x_a, task_id))
+        
+        head_idx = task_id if task_id is not None else len(self.actor_out) - 1
+        action_logits = self.actor_out[head_idx](x_a)
         action_probs = Categorical(logits=action_logits)
         
         # Critic
-        x_c = self.activation(self.critic_fc1(state))
-        x_c = self.activation(self.critic_fc2(x_c))
-        state_value = self.critic_out(x_c)
+        x_c = self.activation(self.critic_fc1(state, task_id))
+        x_c = self.activation(self.critic_fc2(x_c, task_id))
+        state_value = self.critic_out[head_idx](x_c)
         
         action_logprobs = action_probs.log_prob(action)
         dist_entropy = action_probs.entropy()
@@ -679,6 +717,9 @@ class EvoPPO:
         for module in self.policy.modules():
             if isinstance(module, EvoMoRAMLinear):
                 module.add_probe()
+                
+        # Add new independent output head for this task
+        self.policy.add_task_head()
         
         # Sync old policy
         self.policy_old = copy.deepcopy(self.policy)
@@ -792,15 +833,17 @@ class EvoPPO:
         for module in self.policy.modules():
             if isinstance(module, EvoMoRAMLinear):
                 module.add_task()
+                
+        self.policy.add_task_head()
         
         self.policy_old = copy.deepcopy(self.policy)
         n_params = self._rebuild_optimizer(new_lr)
         print(f"  --> Added full MoRAM task. Optimizing {n_params} parameter tensors.")
 
-    def select_action(self, state):
+    def select_action(self, state, task_id=None):
         with torch.no_grad():
             state = torch.FloatTensor(state).to(self.device)
-            action, action_logprob, state_val = self.policy_old.act(state)
+            action, action_logprob, state_val = self.policy_old.act(state, task_id)
             
         self.buffer.states.append(state)
         self.buffer.actions.append(action)
@@ -814,7 +857,7 @@ class EvoPPO:
             next_state_t = torch.FloatTensor(next_state).to(self.device)
             x_c = self.policy_old.activation(self.policy_old.critic_fc1(next_state_t))
             x_c = self.policy_old.activation(self.policy_old.critic_fc2(x_c))
-            next_value = self.policy_old.critic_out(x_c).squeeze(-1)
+            next_value = self.policy_old.critic_out[-1](x_c).squeeze(-1)
             
             next_done_t = torch.FloatTensor(next_done).to(self.device)
             next_value = next_value * (1.0 - next_done_t)
@@ -918,9 +961,10 @@ def evaluate_policy(agent, env, max_obs_dim, task_id=None, n_eval_episodes=10):
             padded_state = pad_state(state, max_obs_dim)
             state_t = torch.FloatTensor(padded_state).unsqueeze(0).to(agent.device)
             with torch.no_grad():
-                x_a = agent.policy.activation(agent.policy.actor_fc1(state_t))
-                x_a = agent.policy.activation(agent.policy.actor_fc2(x_a))
-                action_logits = agent.policy.actor_out(x_a)
+                x_a = agent.policy.activation(agent.policy.actor_fc1(state_t, task_id))
+                x_a = agent.policy.activation(agent.policy.actor_fc2(x_a, task_id))
+                head_idx = task_id if task_id is not None else len(agent.policy.actor_out) - 1
+                action_logits = agent.policy.actor_out[head_idx](x_a)
                 action_probs = F.softmax(action_logits, dim=-1)
                 action = Categorical(probs=action_probs).sample().item()
             state, reward, terminated, truncated, _ = env.step(action)

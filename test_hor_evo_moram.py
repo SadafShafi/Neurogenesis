@@ -36,6 +36,28 @@ def reconstruct_and_load(policy, state_dict_path, device):
                 else:
                     break
                     
+    # Analyze state_dict to find how many heads we have in actor_out and critic_out
+    head_idx = 1
+    while True:
+        actor_key = f"actor_out.{head_idx}.weight"
+        critic_key = f"critic_out.{head_idx}.weight"
+        
+        has_actor = actor_key in state_dict
+        has_critic = critic_key in state_dict
+        
+        if not has_actor and not has_critic:
+            break
+            
+        if has_actor:
+            out_features, in_features = state_dict[actor_key].shape
+            policy.actor_out.append(torch.nn.Linear(in_features, out_features))
+            
+        if has_critic:
+            out_features, in_features = state_dict[critic_key].shape
+            policy.critic_out.append(torch.nn.Linear(in_features, out_features))
+            
+        head_idx += 1
+                    
     policy.load_state_dict(state_dict)
     policy.to(device)
     return policy
